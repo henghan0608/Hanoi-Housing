@@ -15,37 +15,93 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TURSO_DB_URL = os.getenv("TURSO_DB_URL", "")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 
+# Auto-correct protocol scheme for Turso client
+if TURSO_DB_URL.startswith("libsql://") or TURSO_DB_URL.startswith("wss://"):
+    TURSO_DB_URL = TURSO_DB_URL.replace("libsql://", "https://").replace("wss://", "https://")
+
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-# Exchange rate baseline (1 USD = ~25,400 VND)
-VND_PER_USD = 25400
+# USD to VND conversion baseline
+VND_PER_USD = 26060
+
+# Translation mapping for common Vietnamese real estate terms
+TRANSLATION_DICT = {
+    r"\bcho thuê\b": "For Rent:",
+    r"\bcăn hộ\b": "Apartment",
+    r"\bchung cư\b": "Condo",
+    r"\bphòng trọ\b": "Studio/Room",
+    r"\bnhà nguyên căn\b": "Whole House",
+    r"\bbiệt thự\b": "Villa",
+    r"\bđầy đủ nội thất\b": "Fully Furnished",
+    r"\bfull nội thất\b": "Fully Furnished",
+    r"\bphòng ngủ\b": "Bedroom(s)",
+    r"\bpn\b": "BR",
+    r"\bgiá rẻ\b": "Affordable",
+    r"\btrung tâm\b": "Central",
+    r"\bchính chủ\b": "Direct Owner",
+    r"\bban công\b": "with Balcony",
+    r"\bthang máy\b": "with Elevator",
+}
 
 # ==============================================================================
-# 2. HELPER FUNCTIONS: CURRENCY & FORMATTING
+# 2. HELPER FUNCTIONS: TRANSLATION & LAYOUT FORMATTING
 # ==============================================================================
+def translate_title(title: str) -> str:
+    """Translates key Vietnamese terms in housing titles into English."""
+    translated = title
+    for pattern, replacement in TRANSLATION_DICT.items():
+        translated = re.sub(pattern, replacement, translated, flags=re.IGNORECASE)
+    return translated.strip()
+
+def extract_bedrooms(text: str, default_val: Any = None) -> str:
+    """Extracts bedroom count from title or raw metadata."""
+    if default_val and str(default_val) not in ["0", "None", ""]:
+        return str(default_val)
+    match = re.search(r'(\d+)\s*(?:pn|phòng ngủ|bedroom|br)', text, re.IGNORECASE)
+    return match.group(1) if match else "Studio / N/A"
+
 def format_price(raw_price: Any, price_string: str = "") -> str:
-    """Formats numeric VND price and converts to USD (~$XXX/mo)."""
+    """Formats numeric VND price and appends USD conversion (~$XXX USD)."""
     try:
         if raw_price and int(raw_price) > 0:
             vnd_val = int(raw_price)
             usd_val = round(vnd_val / VND_PER_USD)
             formatted_vnd = f"{vnd_val:,}".replace(",", ".")
-            return f"{formatted_vnd} VND (~${usd_val:,}/mo)"
+            return f"{formatted_vnd} VND / month (~${usd_val:,} USD)"
     except (ValueError, TypeError):
         pass
 
-    # Fallback to string if price is a string like "15 triệu/tháng"
     if price_string:
         return price_string
 
     return "Contact for Price"
 
+def build_listing_message(item: Dict[str, Any]) -> str:
+    """Formats message layout strictly matching the design screenshot."""
+    district = html.escape(item['location'].upper())
+    title_en = html.escape(item['title_en'])
+    price_fmt = html.escape(item['price_formatted'])
+    location = html.escape(item['location'])
+    bedrooms = html.escape(str(item['bedrooms']))
+
+    message = (
+        f"🚨 <b>NEW LISTING ALERT | {district}</b>\n\n"
+        f"🏠 <b>{title_en}</b>\n"
+        f"💰 <b>Price:</b> {price_fmt}\n"
+        f"📍 <b>Area:</b> {location}, Hanoi\n"
+        f"🛏 <b>Bedrooms:</b> {bedrooms}\n"
+        f"📲 <b>Contact:</b> Contact on Site\n"
+        f"🌐 <b>Source:</b> Cho Tot\n\n"
+        f"🤖 <i>Powered by Hanoi Housing Radar</i>"
+    )
+    return message
+
 # ==============================================================================
 # 3. DATABASE INITIALIZATION & LIFESPAN
 # ==============================================================================
 async def init_db():
-    """Ensures required tables exist in Turso SQLite database."""
-    if not TURSO_DB_URL or "your-turso-db-name" in TURSO_DB_URL:
+    """Ensures required tables exist in Turso database."""
+    if not TURSO_DB_URL:
         print("Warning: TURSO_DB_URL is missing or unconfigured.")
         return
 
@@ -81,7 +137,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Hanoi Housing Scraper & Bot", lifespan=lifespan)
 
 # ==============================================================================
-# 4. TELEGRAM API HELPERS (HTML Safe)
+# 4. TELEGRAM API HELPERS
 # ==============================================================================
 def send_telegram_message(chat_id: int | str, text: str, reply_markup: dict = None):
     payload = {
@@ -99,29 +155,26 @@ def send_telegram_message(chat_id: int | str, text: str, reply_markup: dict = No
         print(f"Failed to send Telegram message: {e}")
 
 def answer_callback_query(callback_query_id: str, text: str):
-    payload = {
-        "callback_query_id": callback_query_id,
-        "text": text,
-        "show_alert": False
-    }
     try:
-        requests.post(f"{TELEGRAM_API_URL}/answerCallbackQuery", json=payload, timeout=10)
+        requests.post(f"{TELEGRAM_API_URL}/answerCallbackQuery", json={
+            "callback_query_id": callback_query_id,
+            "text": text
+        }, timeout=10)
     except Exception as e:
         print(f"Failed to answer callback query: {e}")
 
 def edit_message_reply_markup(chat_id: int, message_id: int, inline_keyboard: list):
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "reply_markup": {"inline_keyboard": inline_keyboard}
-    }
     try:
-        requests.post(f"{TELEGRAM_API_URL}/editMessageReplyMarkup", json=payload, timeout=10)
+        requests.post(f"{TELEGRAM_API_URL}/editMessageReplyMarkup", json={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": {"inline_keyboard": inline_keyboard}
+        }, timeout=10)
     except Exception as e:
         print(f"Failed to edit message reply markup: {e}")
 
 # ==============================================================================
-# 5. CHO TOT SCRAPER LOGIC
+# 5. CHO TOT SCRAPER & SCHEDULER TASK LOGIC
 # ==============================================================================
 def fetch_chotot_listings() -> List[Dict[str, Any]]:
     """Fetches recent apartment rental listings in Hanoi from Cho Tot API."""
@@ -131,27 +184,27 @@ def fetch_chotot_listings() -> List[Dict[str, Any]]:
     try:
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
-            data = resp.json()
-            ads = data.get("ads", [])
+            ads = resp.json().get("ads", [])
             listings = []
             for ad in ads:
                 list_id = str(ad.get("list_id"))
-                subject = ad.get("subject", "No Title")
+                raw_title = ad.get("subject", "No Title")
                 
-                # Raw numeric price vs string representation
-                raw_price = ad.get("price")
-                price_str = ad.get("price_string", "")
-                formatted_price = format_price(raw_price, price_str)
-
+                translated_title = translate_title(raw_title)
+                price_fmt = format_price(ad.get("price"), ad.get("price_string", ""))
                 area_name = ad.get("area_name", "Hanoi")
-                link = f"https://www.chotot.com/{list_id}.htm"
+                bedrooms = extract_bedrooms(raw_title, ad.get("rooms"))
                 
+                maps_url = f"https://www.google.com/maps/search/{requests.utils.quote(area_name + ' Hanoi')}"
+
                 listings.append({
                     "id": list_id,
-                    "title": subject,
-                    "price": formatted_price,
+                    "title_en": translated_title,
+                    "price_formatted": price_fmt,
                     "location": area_name,
-                    "url": link
+                    "bedrooms": bedrooms,
+                    "url": f"https://www.chotot.com/{list_id}.htm",
+                    "maps_url": maps_url
                 })
             return listings
     except Exception as e:
@@ -172,25 +225,21 @@ async def run_scraper_task():
                     # Save new listing to database
                     await db.execute(
                         "INSERT INTO listings (id, title, price, location, url) VALUES (?, ?, ?, ?, ?)",
-                        (item["id"], item["title"], item["price"], item["location"], item["url"])
+                        (item["id"], item["title_en"], item["price_formatted"], item["location"], item["url"])
                     )
                     
-                    # Post notification to Telegram
+                    # Post formatted alert to Telegram
                     if TELEGRAM_CHAT_ID:
-                        safe_title = html.escape(item['title'])
-                        safe_price = html.escape(item['price'])
-                        safe_loc = html.escape(item['location'])
-
-                        text = (
-                            f"🏠 <b>{safe_title}</b>\n"
-                            f"💰 <b>Price:</b> {safe_price}\n"
-                            f"📍 <b>Location:</b> {safe_loc}"
-                        )
+                        text = build_listing_message(item)
+                        
                         markup = {
                             "inline_keyboard": [
                                 [
-                                    {"text": "⭐ Bookmark", "callback_data": f"bookmark:{item['id']}"},
-                                    {"text": "🔗 View Listing", "url": item["url"]}
+                                    {"text": "🔗 View Original Listing", "url": item["url"]}
+                                ],
+                                [
+                                    {"text": "📍 Area Map", "url": item["maps_url"]},
+                                    {"text": "⭐ Bookmark", "callback_data": f"bookmark:{item['id']}"}
                                 ]
                             ]
                         }
@@ -199,7 +248,7 @@ async def run_scraper_task():
         print(f"Error processing scraped listings: {e}")
 
 # ==============================================================================
-# 6. FASTAPI ROUTES & WEBHOOKS
+# 6. FASTAPI ROUTES & CRON-JOB / WEBHOOK ENDPOINTS
 # ==============================================================================
 @app.get("/")
 def read_root():
@@ -213,7 +262,7 @@ def trigger_scrape(background_tasks: BackgroundTasks):
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    """Handles incoming callback queries and commands from Telegram."""
+    """Handles incoming callback queries and user commands from Telegram."""
     try:
         data = await request.json()
     except Exception:
@@ -241,14 +290,14 @@ async def telegram_webhook(request: Request):
                     )
                     answer_callback_query(callback_id, "Saved to bookmarks!")
 
-                    new_keyboard = [[{"text": "❌ Remove Bookmark", "callback_data": f"unbookmark:{listing_id}"}]]
                     if "reply_markup" in message and "inline_keyboard" in message["reply_markup"]:
-                        orig_buttons = message["reply_markup"]["inline_keyboard"][0]
-                        for btn in orig_buttons:
-                            if "url" in btn:
-                                new_keyboard[0].append(btn)
-
-                    edit_message_reply_markup(chat_id, message_id, new_keyboard)
+                        orig_rows = message["reply_markup"]["inline_keyboard"]
+                        for row in orig_rows:
+                            for btn in row:
+                                if btn.get("callback_data") == f"bookmark:{listing_id}":
+                                    btn["text"] = "❌ Remove Bookmark"
+                                    btn["callback_data"] = f"unbookmark:{listing_id}"
+                        edit_message_reply_markup(chat_id, message_id, orig_rows)
 
                 elif action == "unbookmark":
                     await db.execute(
@@ -257,14 +306,14 @@ async def telegram_webhook(request: Request):
                     )
                     answer_callback_query(callback_id, "Removed from bookmarks.")
 
-                    new_keyboard = [[{"text": "⭐ Bookmark", "callback_data": f"bookmark:{listing_id}"}]]
                     if "reply_markup" in message and "inline_keyboard" in message["reply_markup"]:
-                        orig_buttons = message["reply_markup"]["inline_keyboard"][0]
-                        for btn in orig_buttons:
-                            if "url" in btn:
-                                new_keyboard[0].append(btn)
-
-                    edit_message_reply_markup(chat_id, message_id, new_keyboard)
+                        orig_rows = message["reply_markup"]["inline_keyboard"]
+                        for row in orig_rows:
+                            for btn in row:
+                                if btn.get("callback_data") == f"unbookmark:{listing_id}":
+                                    btn["text"] = "⭐ Bookmark"
+                                    btn["callback_data"] = f"bookmark:{listing_id}"
+                        edit_message_reply_markup(chat_id, message_id, orig_rows)
 
         return {"status": "ok"}
 
@@ -283,7 +332,6 @@ async def telegram_webhook(request: Request):
                     WHERE b.user_id = ?
                     ORDER BY b.created_at DESC
                 """, (chat_id,))
-                
                 rows = res.rows
 
             if not rows:
