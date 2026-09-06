@@ -1,16 +1,16 @@
 import os
 import json
 import requests
-import libsql_experimental as libsql
-from fastapi import FastAPI, Request
+import libsql_client
+from fastapi import FastAPI, Request, BackgroundTasks
 from pydantic import BaseModel, Field
 from openai import OpenAI
 
 # ==================== CONFIGURATION ====================
-TELEGRAM_BOT_TOKEN = os.environ.get("8845223451:AAEdPyWR8XXFH3mJyYyujqgfi15AMrY8dh4")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1004325097866")
-TURSO_DB_URL = os.environ.get("libsql://hanoi-housing-henghan0608.aws-ap-northeast-1.turso.io")
-TURSO_AUTH_TOKEN = os.environ.get("eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODg3MjI0OTQsImlkIjoiMDFhMDc4MmEtYzUwMS03NGYzLWJjNDQtMWE5MDg0ZTFmOTE5Iiwia2lkIjoiTlhSUmQ5QjNnVEU2T1ZQdV9DMEt1S000VW9xNU5DUEc2OHY5RjhFMGNiZyIsInJpZCI6IjBiYTg5ZmYyLWFjZjItNDVlMy04ZDYwLTU5OTcyYmUzZTU1YiJ9.Nv3UApmgGtiFIBZNE3KFkUMNQZk9mVVrHqeHAHm3Z8SeBzhNnu-s-MPOjaE6SVpdUeOJ6HnEe4rbzZ-5ZePkBQ")
+TURSO_DB_URL = os.environ.get("TURSO_DB_URL")
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 VND_PER_USD = 25400
@@ -18,9 +18,22 @@ VND_PER_USD = 25400
 app = FastAPI()
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# ---------------- DATABASE CONNECTION ----------------
+
+# ---------------- 1. STRUCTURED OUTPUT SCHEMA ----------------
+class RentalListing(BaseModel):
+    title_en: str = Field(description="Expat Housing - Worry Free / High quality concise summary title")
+    price_vnd: int = Field(description="Price in VND as an integer (e.g., 12000000). Set to 0 if unknown.")
+    district: str = Field(description="District name in Hanoi e.g., Tay Ho, Cau Giay, Ba Dinh")
+    bedrooms: int = Field(description="Number of bedrooms, default to 1 if unknown")
+    contact_phone: str = Field(description="Contact phone number or 'Contact on Site' if not available")
+
+
+# ---------------- 2. DATABASE HELPERS ----------------
 def get_db():
-    return libsql.connect(f"{TURSO_DB_URL}?auth_token={TURSO_AUTH_TOKEN}")
+    return libsql_client.create_client_sync(
+        url=TURSO_DB_URL,
+        auth_token=TURSO_AUTH_TOKEN
+    )
 
 def init_db():
     conn = get_db()
@@ -47,44 +60,125 @@ def init_db():
             UNIQUE(user_id, listing_url)
         )
     """)
-    conn.commit()
     conn.close()
 
-init_db()
+# Initialize DB on start
+try:
+    init_db()
+except Exception as e:
+    print(f"Database initialization warning: {e}")
 
-# ---------------- HELPER FUNCTIONS ----------------
-def get_listing_details_by_id(listing_id: int):
+
+# ---------------- 3. SCRAPER & TELEGRAM LOGIC ----------------
+def is_url_seen(url: str) -> bool:
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT url, title, district, price_vnd, bedrooms, contact_phone, source FROM seen_listings WHERE id = ?", (listing_id,))
-    row = cursor.fetchone()
+    res = conn.execute("SELECT id FROM seen_listings WHERE url = ?", (url,))
+    seen = len(res.rows) > 0
     conn.close()
-    if row:
-        return {"url": row[0], "title": row[1], "district": row[2], "price_vnd": row[3], "bedrooms": row[4], "contact_phone": row[5], "source": row[6]}
-    return None
+    return seen
 
-def save_bookmark(user_id: str, listing_url: str) -> bool:
+def save_seen_listing(url, title, district, price_vnd, bedrooms, contact_phone, source="ChoTot") -> int:
     conn = get_db()
+    res = conn.execute("""
+        INSERT INTO seen_listings (url, title, district, price_vnd, bedrooms, contact_phone, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (url, title, district, price_vnd, bedrooms, contact_phone, source))
+    listing_id = res.last_insert_rowid
+    conn.close()
+    return listing_id
+
+def send_telegram_alert(listing_id, title, price_vnd, district, bedrooms, phone, original_url):
+    usd_approx = round(price_vnd / VND_PER_USD) if price_vnd > 0 else 0
+    price_display = f"<b>{price_vnd:,.0f} VND</b> / month (~${usd_approx:,} USD)" if price_vnd > 0 else "<b>Contact Landlord</b>"
+    
+    maps_url = f"https://www.google.com/maps/search/?api=1&query=Apartment+for+rent+{district.replace(' ', '+')}+Hanoi"
+
+    msg_html = (
+        f"🏠 <b>{title}</b>\n\n"
+        f"💰 <b>Price:</b> {price_display}\n"
+        f"📍 <b>District:</b> {district}, Hanoi\n"
+        f"🛏️ <b>Bedrooms:</b> {bedrooms}\n"
+        f"📲 <b>Contact Phone:</b> {phone}\n\n"
+        f"🔍 <i>Scraped from ChoTot</i>"
+    )
+
+    inline_keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "🔗 View Listing", "url": original_url},
+                {"text": "📍 Map", "url": maps_url}
+            ],
+            [
+                {"text": "⭐ Bookmark", "callback_data": f"bm:{listing_id}"}
+            ]
+        ]
+    }
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg_html,
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(inline_keyboard)
+    }
+    requests.post(url, data=payload)
+
+def scrape_chotot():
+    """Scrapes ChoTot API for fresh Hanoi rental listings."""
+    chotot_url = "https://gateway.chotot.com/v1/public/ad-listing?cg=1010&region=12&limit=10"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
     try:
-        conn.execute("INSERT INTO bookmarks (user_id, listing_url) VALUES (?, ?)", (user_id, listing_url))
-        conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        conn.close()
+        response = requests.get(chotot_url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            print(f"ChoTot API returned status {response.status_code}")
+            return 0
 
-def get_user_bookmarks(user_id: str):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT listing_url, created_at FROM bookmarks WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+        data = response.json()
+        ads = data.get("ads", [])
+        new_count = 0
 
-# ---------------- WEBHOOK ENDPOINT ----------------
+        for ad in ads:
+            list_id = ad.get("list_id")
+            if not list_id:
+                continue
+
+            item_url = f"https://nhatot.com/vi/{list_id}.htm"
+            if is_url_seen(item_url):
+                continue
+
+            raw_subject = ad.get("subject", "Hanoi Rental Property")
+            price = ad.get("price", 0)
+            area_name = ad.get("area_name", "Hanoi")
+            bedrooms = ad.get("num_bedrooms", 1)
+            phone = ad.get("phone", "Contact on Site")
+
+            # Save listing to Turso
+            listing_id = save_seen_listing(item_url, raw_subject, area_name, price, bedrooms, phone)
+            
+            # Post alert to Telegram Channel
+            send_telegram_alert(listing_id, raw_subject, price, area_name, bedrooms, phone, item_url)
+            new_count += 1
+
+        return new_count
+    except Exception as e:
+        print(f"Error during ChoTot scraping: {e}")
+        return 0
+
+
+# ---------------- 4. API ENDPOINTS ----------------
+
+@app.get("/scrape")
+@app.post("/scrape")
+async def trigger_scrape(background_tasks: BackgroundTasks):
+    """Triggered by Cron-Job.org every 15 minutes."""
+    background_tasks.add_task(scrape_chotot)
+    return {"status": "ok", "message": "Scraper task queued successfully"}
+
+
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
+    """Handles Telegram inline button callbacks and commands."""
     update = await request.json()
 
     # 1. Handle Bookmark Button Click
@@ -97,18 +191,28 @@ async def telegram_webhook(request: Request):
         if data_str.startswith("bm:"):
             try:
                 listing_id = int(data_str.split("bm:")[1])
-                listing = get_listing_details_by_id(listing_id)
+                conn = get_db()
+                res = conn.execute("SELECT url, title FROM seen_listings WHERE id = ?", (listing_id,))
+                row = res.rows[0] if res.rows else None
+                
+                if row:
+                    b_url = row[0]
+                    # Insert bookmark
+                    try:
+                        conn.execute("INSERT INTO bookmarks (user_id, listing_url) VALUES (?, ?)", (user_id, b_url))
+                        toast_text = "⭐ Saved to your bot bookmarks!"
+                    except Exception:
+                        toast_text = "ℹ️ Already in your bookmarks!"
+                    conn.close()
 
-                if listing:
-                    is_new = save_bookmark(user_id, listing["url"])
-                    toast_text = "⭐ Saved to your bot bookmarks!" if is_new else "ℹ️ Already in your bookmarks!"
-
+                    # Answer popup toast
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={
                         "callback_query_id": cb_id,
                         "text": toast_text,
                         "show_alert": False
                     })
 
+                    # Update button text to "✅ Bookmarked"
                     msg_obj = cb.get("message")
                     if msg_obj:
                         msg_chat_id = msg_obj["chat"]["id"]
@@ -117,9 +221,9 @@ async def telegram_webhook(request: Request):
 
                         if "inline_keyboard" in existing_markup:
                             updated_keyboard = []
-                            for row in existing_markup["inline_keyboard"]:
+                            for row_item in existing_markup["inline_keyboard"]:
                                 new_row = []
-                                for button in row:
+                                for button in row_item:
                                     if button.get("callback_data") == data_str:
                                         new_row.append({"text": "✅ Bookmarked", "callback_data": data_str})
                                     else:
@@ -134,22 +238,25 @@ async def telegram_webhook(request: Request):
             except Exception as e:
                 print(f"Callback error: {e}")
 
-    # 2. Handle Commands (/start, /bookmarks)
+    # 2. Handle /bookmarks Command
     elif "message" in update and "text" in update["message"]:
         msg = update["message"]
         text = msg["text"].strip()
         chat_id = msg["chat"]["id"]
         user_id = str(msg["from"]["id"])
 
-        if text == "/start":
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": "👋 Welcome to <b>Hanoi Housing Radar</b>!\n\nUse /bookmarks to view saved properties.",
-                "parse_mode": "HTML"
-            })
+        if text in ["/bookmarks", f"/bookmarks@{TELEGRAM_BOT_TOKEN}"]:
+            conn = get_db()
+            res = conn.execute("""
+                SELECT s.title, s.district, s.price_vnd, s.bedrooms, s.contact_phone, s.source, b.listing_url, b.created_at
+                FROM bookmarks b
+                LEFT JOIN seen_listings s ON b.listing_url = s.url
+                WHERE b.user_id = ?
+                ORDER BY b.created_at DESC
+            """, (user_id,))
+            bookmarks = res.rows
+            conn.close()
 
-        elif text == "/bookmarks" or text.startswith("/bookmarks@"):
-            bookmarks = get_user_bookmarks(user_id)
             if not bookmarks:
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                     "chat_id": chat_id,
@@ -163,28 +270,21 @@ async def telegram_webhook(request: Request):
                     "parse_mode": "HTML"
                 })
 
-                for b_url, b_time in bookmarks:
-                    conn = get_db()
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT title, district, price_vnd, bedrooms, contact_phone, source FROM seen_listings WHERE url = ?", (b_url,))
-                    row = cursor.fetchone()
-                    conn.close()
-
-                    if row:
-                        title, district, price_vnd, bedrooms, contact_phone, source = row
-                        usd_approx = round(price_vnd / VND_PER_USD) if price_vnd > 0 else 0
-                        price_display = f"<b>{price_vnd:,.0f} VND</b> / month (~${usd_approx:,} USD)" if price_vnd > 0 else "<b>Contact Landlord</b>"
+                for b in bookmarks:
+                    title, district, price_vnd, bedrooms, phone, source, b_url, b_time = b
+                    if title:
+                        usd_approx = round(price_vnd / VND_PER_USD) if price_vnd and price_vnd > 0 else 0
+                        price_display = f"<b>{price_vnd:,.0f} VND</b> / month (~${usd_approx:,} USD)" if price_vnd and price_vnd > 0 else "<b>Contact Landlord</b>"
                         card_msg = (
                             f"🏠 <b>{title}</b>\n"
                             f"💰 <b>Price:</b> {price_display}\n"
                             f"📍 <b>Area:</b> {district}, Hanoi\n"
                             f"🛏️ <b>Bedrooms:</b> {bedrooms}\n"
-                            f"📲 <b>Contact:</b> {contact_phone}\n"
-                            f"🌐 <b>Source:</b> {source}\n"
-                            f"📅 <i>Saved on: {b_time[:10]}</i>"
+                            f"📲 <b>Contact:</b> {phone}\n"
+                            f"📅 <i>Saved on: {str(b_time)[:10]}</i>"
                         )
                     else:
-                        card_msg = f"🔗 <a href='{b_url}'>View Original Listing</a>\n📅 <i>Saved on: {b_time[:10]}</i>"
+                        card_msg = f"🔗 <a href='{b_url}'>View Original Listing</a>"
 
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                         "chat_id": chat_id,
@@ -194,6 +294,7 @@ async def telegram_webhook(request: Request):
                     })
 
     return {"status": "ok"}
+
 
 @app.get("/")
 def health_check():
