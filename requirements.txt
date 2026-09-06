@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 requests
-libsql-experimental
+libsql-client
 openai
 pydantic
