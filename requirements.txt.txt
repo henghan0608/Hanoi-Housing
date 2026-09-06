@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+requests
+libsql-experimental
+openai
+pydantic
