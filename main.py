@@ -255,10 +255,16 @@ def read_root():
     return {"status": "online", "service": "Hanoi Housing Scraper"}
 
 @app.get("/scrape")
-def trigger_scrape(background_tasks: BackgroundTasks):
-    """Endpoint triggered by Cron-Job.org every 15 minutes."""
-    background_tasks.add_task(run_scraper_task)
-    return {"status": "ok", "message": "Scraper task queued successfully"}
+async def trigger_scrape(background_tasks: BackgroundTasks):
+    """Safely triggers the scraper without ever returning large response payloads."""
+    async def safe_scrape_wrapper():
+        try:
+            await run_scraper_task()
+        except Exception as e:
+            print(f"Scraper task encountered an error: {e}")
+
+    background_tasks.add_task(safe_scrape_wrapper)
+    return {"status": "ok"}
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
