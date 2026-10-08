@@ -361,3 +361,11 @@ async def telegram_webhook(request: Request):
                     send_telegram_message(chat_id, item_text, reply_markup=markup)
 
     return {"status": "ok"}
+
+# ==============================================================================
+# 7. HEARTBEAT / KEEP-ALIVE ENDPOINT
+# ==============================================================================
+@app.get("/ping")
+def ping_healthcheck():
+    """Lightweight endpoint called every 10 mins to keep Render awake."""
+    return {"status": "awake"}
